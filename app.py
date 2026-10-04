@@ -1,4 +1,5 @@
 import os
+import math
 from datetime import date
 from pathlib import Path
 from uuid import uuid4
@@ -11,24 +12,33 @@ import database
 from services.disease_analyzer import get_analyzer
 from services.lifecycle import days_since, estimate_growth_stage
 from services.weather import get_weather_summary
+from services.monsoon.forecast import generate_forecast, sowing_decision
+from services.monsoon.providers import search_locations, reverse_geocode, current_climate_drivers
+from services.monsoon.decision import build_alerts, crop_advisories, explain_forecast, sowing_window_assessment
+from models.monsoon.training import forecast_with_model_run
+from data.climate.boundaries import resolve_boundary
 
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = Path(os.getenv("AGRISHIELD_UPLOAD_DIR", BASE_DIR / "uploads"))
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
-UPLOAD_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 database.init_db()
 
 app = Flask(__name__, static_folder="dist", static_url_path="")
 app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
+app.config["JSON_SORT_KEYS"] = False
+
+ALLOWED_ORIGIN = os.getenv("AGRISHIELD_ALLOWED_ORIGIN", "").strip()
 
 
 @app.after_request
 def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    if ALLOWED_ORIGIN:
+        response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     return response
 
 
@@ -116,7 +126,11 @@ def request_coordinates(source):
     if latitude in (None, "") or longitude in (None, ""):
         return None, None
     try:
-        return float(latitude), float(longitude)
+        parsed_latitude, parsed_longitude = float(latitude), float(longitude)
+        if (not math.isfinite(parsed_latitude) or not math.isfinite(parsed_longitude)
+                or not -90 <= parsed_latitude <= 90 or not -180 <= parsed_longitude <= 180):
+            return None, None
+        return parsed_latitude, parsed_longitude
     except ValueError:
         return None, None
 
@@ -181,19 +195,28 @@ def crop_with_summary(crop):
         database.list_scans(crop["id"]),
         key=lambda item: (item["scan_date"], item["id"]),
     )
-    lifecycle = estimate_growth_stage(crop["crop_name"], crop["planting_date"])
+    calendar = database.get_crop_calendar_rule(crop.get("location_id"), crop["crop_name"])
+    lifecycle = estimate_growth_stage(crop["crop_name"], crop["planting_date"],
+                                      calendar_rules=(calendar or {}).get("lifecycle_stages"))
     latest = scans[-1] if scans else None
 
     return {
         **crop,
         "days_since_planting": lifecycle["days_since_planting"],
         "growth_stage": lifecycle["growth_stage"],
-        "growth_stage_label": lifecycle["label"],
+        "next_stage": lifecycle["next_stage"],
+        "days_to_next_stage": lifecycle["days_to_next_stage"],
+        "lifecycle_source": lifecycle["lifecycle_source"],
+        "lifecycle_available": lifecycle["lifecycle_available"],
         "scan_count": len(scans),
         "latest_health_status": latest["health_status"] if latest else "No scans yet",
         "last_scan_date": latest["scan_date"] if latest else "",
         "health_trend": health_trend(scans),
         "latest_scan": latest,
+        "crop_calendar": ({"source": calendar["source"], "version": calendar.get("version"),
+                           "sowing_start": calendar.get("sowing_start"), "sowing_end": calendar.get("sowing_end"),
+                           "water_requirement_mm_day": calendar.get("water_requirement_mm_day")}
+                          if calendar else None),
     }
 
 
@@ -216,6 +239,157 @@ def crop_detail(crop):
     }
 
 
+def active_location():
+    return database.get_setting("active_location")
+
+
+def with_boundary_metadata(location):
+    if not location or location.get("latitude") is None or location.get("longitude") is None:
+        return location
+    boundary_path = os.getenv("AGRISHIELD_BOUNDARY_GEOJSON")
+    if not boundary_path:
+        return location
+    try:
+        boundary = resolve_boundary(location["latitude"], location["longitude"], boundary_path)
+    except (OSError, ValueError, TypeError):
+        return location
+    if not boundary:
+        return location
+    enriched = {**location, **{key: value for key, value in boundary.items() if key != "boundary_source"}}
+    if boundary.get("village_cluster"):
+        enriched["village"] = boundary["village_cluster"]
+    enriched["boundary_source"] = "Configured authoritative GeoJSON"
+    enriched["admin_level_available"] = boundary.get("boundary_level", "coordinates")
+    return enriched
+
+
+def selected_location_id(source=None, location=None, crop=None):
+    if source is not None:
+        value = source.get("location_id")
+        if value:
+            return str(value).strip()
+    for item in (crop, location):
+        if item and item.get("location_id"):
+            return str(item["location_id"]).strip()
+    return None
+
+
+def forecast_for_request(source=None, crop=None):
+    source = source or request.args
+    latitude, longitude = request_coordinates(source)
+    coordinate_supplied = source.get("latitude") not in (None, "") or source.get("longitude") not in (None, "")
+    invalid_coordinates = coordinate_supplied and (latitude is None or longitude is None)
+    location = None if invalid_coordinates else active_location()
+    requested_coordinates = latitude is not None and longitude is not None
+    if (not invalid_coordinates and (latitude is None or longitude is None)
+            and crop and crop.get("latitude") is not None and crop.get("longitude") is not None):
+        latitude, longitude = crop["latitude"], crop["longitude"]
+        location = {**(location or {}), **crop}
+    if not invalid_coordinates and (latitude is None or longitude is None):
+        latitude = (location or {}).get("latitude")
+        longitude = (location or {}).get("longitude")
+    def coordinates_match(item):
+        if not item or item.get("latitude") is None or item.get("longitude") is None:
+            return False
+        try:
+            return (abs(float(item["latitude"]) - float(latitude)) < 0.00001 and
+                    abs(float(item["longitude"]) - float(longitude)) < 0.00001)
+        except (TypeError, ValueError):
+            return False
+
+    crop_matches = coordinates_match(crop)
+    active_matches = coordinates_match(location)
+    if latitude is not None and longitude is not None:
+        matched_location = crop if crop_matches else location if active_matches else None
+        if matched_location:
+            location = {**(location or {}), **matched_location,
+                        "latitude": float(latitude), "longitude": float(longitude)}
+        else:
+            location = {"latitude": float(latitude), "longitude": float(longitude),
+                        "label": "Selected coordinates", "admin_level_available": "coordinates"}
+        location = with_boundary_metadata(location)
+    forecast = generate_forecast(latitude, longitude, crop, location)
+    if invalid_coordinates:
+        location_id = None
+    elif requested_coordinates:
+        location_id = (crop.get("location_id") if crop_matches else
+                       (active_location() or {}).get("location_id") if active_matches else None)
+    else:
+        location_id = selected_location_id(source, location, crop)
+    run = database.latest_validated_model_run(location_id) if location_id else None
+    local_rows = database.get_climate_observations(location_id, limit=90) if run else []
+    if run:
+        model_horizons = forecast_with_model_run(local_rows, run)
+        forecast["agri_model"] = {"available": any(item["available"] for item in model_horizons.values()),
+                                  "model_version": run["model_version"], "validated": run["validated"],
+                                  "horizons": model_horizons, "data_timestamp": run["data_timestamp"]}
+    else:
+        forecast["agri_model"] = {"available": False, "validated": False, "model_version": None,
+                                  "horizons": {}, "reason": "No validated AgriShield model is trained for this exact location. Provider guidance remains separate."}
+    try:
+        horizon = int(source.get("horizon_days", 14))
+    except (TypeError, ValueError):
+        horizon = 14
+    forecast["explanation"] = explain_forecast(forecast, horizon if horizon in (7, 14, 21, 30) else 14)
+    forecast["data_transparency"] = {
+        "data_source": (forecast.get("source") or {}).get("name"),
+        "observation_timestamp": (forecast.get("recent_rainfall") or {}).get("last_observation_date"),
+        "forecast_timestamp": (forecast.get("source") or {}).get("generated_at"),
+        "forecast_horizon_days": (forecast.get("explanation") or {}).get("horizon_days"),
+        "location": forecast.get("location"),
+        "model_version": (forecast.get("agri_model") or {}).get("model_version"),
+        "validated": bool((forecast.get("agri_model") or {}).get("validated")),
+        "provider_output_is_agri_ml": False,
+    }
+    forecast["advisory_details"] = crop_advisories(forecast, crop)
+    return forecast
+
+
+def parse_crop_payload(payload, existing=None):
+    existing = existing or {}
+    crop_name = required_text(payload, "crop_name", "Crop name")
+    field_name = required_text(payload, "field_name", "Field name")
+    planting_date = required_text(payload, "planting_date", "Sowing date")
+    try:
+        planting_date = date.fromisoformat(planting_date[:10]).isoformat()
+    except ValueError as error:
+        raise ValueError("Enter a valid sowing date.") from error
+    area = payload.get("field_area", existing.get("field_area"))
+    try:
+        area = float(area)
+        if not math.isfinite(area) or area <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("Field area must be a positive number.")
+    irrigation_type = str(payload.get("irrigation_type", existing.get("irrigation_type", ""))).strip()
+    if irrigation_type not in {"rainfed", "canal", "drip", "sprinkler", "borewell", "other"}:
+        raise ValueError("Choose an irrigation type.")
+    location = active_location() or {}
+    latitude = payload.get("latitude", existing.get("latitude", location.get("latitude")))
+    longitude = payload.get("longitude", existing.get("longitude", location.get("longitude")))
+    try:
+        latitude, longitude = float(latitude), float(longitude)
+        if not math.isfinite(latitude) or not math.isfinite(longitude) or not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("Set a real field location using GPS or location search before saving this crop.")
+    return {
+        "crop_name": crop_name, "field_name": field_name, "planting_date": planting_date,
+        "location": str(payload.get("location", existing.get("location", location.get("label", "")))).strip(),
+        "latitude": latitude, "longitude": longitude,
+        "state": payload.get("state", existing.get("state", location.get("state"))),
+        "district": payload.get("district", existing.get("district", location.get("district"))),
+        "block": payload.get("block", existing.get("block", location.get("block"))),
+        "village_cluster": payload.get("village_cluster", existing.get("village_cluster", location.get("village_cluster") or location.get("village"))),
+        "field_area": area,
+        "field_area_unit": str(payload.get("field_area_unit", existing.get("field_area_unit", "acre"))).strip() or "acre",
+        "irrigation_type": irrigation_type,
+        "status": "planned" if planting_date > date.today().isoformat() else "active",
+        "location_id": payload.get("location_id", existing.get("location_id", location.get("location_id"))),
+        "notes": str(payload.get("notes", existing.get("notes", ""))).strip(),
+    }
+
+
 @app.route("/api/health", methods=["GET"])
 def api_health():
     return jsonify({"ok": True, "database": str(database.DB_PATH), "uploads": str(UPLOAD_DIR)})
@@ -227,6 +401,221 @@ def api_weather():
     if latitude is None or longitude is None:
         return error_response("Latitude and longitude are required.")
     return jsonify({"weather": get_weather_summary(latitude, longitude)})
+
+
+@app.route("/api/location", methods=["GET", "POST", "OPTIONS"])
+def api_location():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if request.method == "GET":
+        return jsonify({"location": active_location()})
+    payload = request.get_json(silent=True) or {}
+    try:
+        latitude = float(payload.get("latitude"))
+        longitude = float(payload.get("longitude"))
+        if not math.isfinite(latitude) or not math.isfinite(longitude) or not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
+            raise ValueError
+    except (TypeError, ValueError):
+        return error_response("A valid latitude and longitude are required.")
+    location = {
+        "label": str(payload.get("label") or "Selected map location").strip()[:180],
+        "latitude": latitude, "longitude": longitude,
+        "village": str(payload.get("village") or "").strip() or None,
+        "village_cluster": str(payload.get("village_cluster") or "").strip() or None,
+        "block": str(payload.get("block") or "").strip() or None,
+        "district": str(payload.get("district") or "").strip() or None,
+        "state": str(payload.get("state") or "").strip() or None,
+        "country": str(payload.get("country") or "").strip() or None,
+        "admin_level_available": str(payload.get("admin_level_available") or "coordinates"),
+        "location_id": str(payload.get("location_id") or "").strip() or None,
+        "boundary_id": str(payload.get("boundary_id") or "").strip() or None,
+        "boundary_level": str(payload.get("boundary_level") or "").strip() or None,
+        "boundary_source": str(payload.get("boundary_source") or "").strip() or None,
+        "source": str(payload.get("source") or "User-selected coordinates"),
+        "status": str(payload.get("status") or "Location selected"),
+    }
+    database.set_setting("active_location", location)
+    return jsonify({"location": location}), 200
+
+
+@app.route("/api/location/search", methods=["GET"])
+def api_location_search():
+    query = request.args.get("q", "").strip()
+    if len(query) < 2:
+        return error_response("Enter at least two characters to search locations.")
+    try:
+        return jsonify({"results": [with_boundary_metadata(result) for result in search_locations(query)]})
+    except Exception:
+        return jsonify({"error": "Location search is unavailable. Try coordinates or use your device location."}), 503
+
+
+@app.route("/api/location/reverse", methods=["GET"])
+def api_location_reverse():
+    latitude, longitude = request_coordinates(request.args)
+    if latitude is None or longitude is None or not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
+        return error_response("A valid latitude and longitude are required.")
+    try:
+        location = reverse_geocode(round(latitude, 5), round(longitude, 5))
+        return jsonify({"location": with_boundary_metadata(location)})
+    except Exception:
+        return jsonify({"error": "Address lookup is unavailable; location remains at coordinate level."}), 503
+
+
+@app.route("/api/monsoon/forecast", methods=["GET"])
+@app.route("/api/monsoon/outlook", methods=["GET"])
+def api_monsoon_forecast():
+    crop = None
+    crop_id = request.args.get("crop_id")
+    if crop_id:
+        try:
+            crop_record = database.get_crop(int(crop_id))
+        except (TypeError, ValueError):
+            crop_record = None
+        if crop_record is None:
+            return error_response("Crop profile was not found.", 404)
+        crop = crop_with_summary(crop_record)
+    return jsonify({"forecast": forecast_for_request(request.args, crop)})
+
+
+@app.route("/api/monsoon/events", methods=["GET"])
+def api_monsoon_events():
+    forecast = forecast_for_request(request.args)
+    return jsonify({"events": forecast.get("events"), "available": forecast.get("available"), "data_status": forecast.get("data_status")})
+
+
+@app.route("/api/monsoon/risk-map", methods=["GET"])
+def api_monsoon_risk_map():
+    forecast = forecast_for_request(request.args)
+    boundary_match = bool((forecast.get("location") or {}).get("boundary_id"))
+    return jsonify({"location": forecast.get("location"), "daily": forecast.get("daily", []),
+                    "events": forecast.get("events"), "boundaries_available": boundary_match,
+                    "boundary_match": boundary_match,
+                    "spatial_resolution": "selected weather grid point; no area aggregation",
+                    "boundary_status": "An administrative boundary identifies this point, but risk values remain grid-point guidance." if boundary_match else "Administrative boundary data is not connected. The map shows the selected weather grid point only."})
+
+
+@app.route("/api/monsoon/sowing-decision", methods=["POST", "OPTIONS"])
+def api_sowing_decision():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    payload = request.get_json(silent=True) or {}
+    forecast = forecast_for_request(payload)
+    try:
+        horizon = int(payload.get("horizon_days", 14))
+    except (TypeError, ValueError):
+        horizon = 0
+    if horizon not in (7, 14, 21, 30):
+        return error_response("Forecast horizon must be 7, 14, 21 or 30 days.")
+    crop_name = str(payload.get("crop_name") or "").strip()[:80]
+    if not crop_name:
+        return error_response("Choose a crop before reviewing sowing conditions.")
+    result = sowing_decision(forecast, crop_name, bool(payload.get("irrigation_available")), horizon,
+                             str(payload.get("crop_stage") or "")[:100],
+                             str(payload.get("sowing_preference") or "")[:100])
+    return jsonify({"decision": result, "data_status": forecast.get("data_status")})
+
+
+@app.route("/api/monsoon/advisory", methods=["GET"])
+def api_monsoon_advisory():
+    crop = None
+    crop_id = request.args.get("crop_id")
+    if crop_id:
+        try:
+            record = database.get_crop(int(crop_id))
+        except (TypeError, ValueError):
+            record = None
+        if record is None:
+            return error_response("Crop profile was not found.", 404)
+        crop = crop_with_summary(record)
+    forecast = forecast_for_request(request.args, crop)
+    return jsonify({"advisory": forecast.get("advisory", []),
+                    "advisory_details": forecast.get("advisory_details", []),
+                    "available": forecast.get("available"), "data_status": forecast.get("data_status"),
+                    "events": forecast.get("events")})
+
+
+@app.route("/api/climate", methods=["GET"])
+def api_climate():
+    return jsonify(current_climate_drivers())
+
+
+@app.route("/api/monsoon/model-performance", methods=["GET"])
+def api_model_performance():
+    location_id = request.args.get("location_id") or selected_location_id(request.args, active_location())
+    runs = database.list_model_runs(location_id) if location_id else []
+    public_runs = []
+    for run in runs:
+        public_runs.append({**run, "models": None, "model_count": len(run.get("models") or {})})
+    return jsonify({"location_id": location_id, "runs": public_runs,
+                    "available": any(run.get("validated") for run in public_runs),
+                    "status": "Metrics are from chronological held-out data." if public_runs else
+                    "No local model has been trained. Metrics are not available and have not been invented."})
+
+
+@app.route("/api/monsoon/sowing-window", methods=["GET", "POST", "OPTIONS"])
+def api_sowing_window():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    payload = request.get_json(silent=True) if request.method == "POST" else request.args
+    payload = payload or {}
+    crop_name = str(payload.get("crop_name") or "").strip()
+    if not crop_name:
+        return error_response("Choose a crop to assess a sowing window.")
+    crop = None
+    crop_id = payload.get("crop_id")
+    if crop_id:
+        try:
+            crop_record = database.get_crop(int(crop_id))
+        except (TypeError, ValueError):
+            crop_record = None
+        if crop_record is None:
+            return error_response("Crop profile was not found.", 404)
+        crop = crop_with_summary(crop_record)
+        crop_name = crop_record["crop_name"]
+    forecast = forecast_for_request(payload, crop)
+    result = sowing_window_assessment(crop_name, forecast, crop)
+    return jsonify({"assessment": result, "data_transparency": forecast.get("data_transparency")})
+
+
+@app.route("/api/monsoon/alerts", methods=["GET"])
+def api_monsoon_alerts():
+    location = active_location()
+    location_id = selected_location_id(request.args, location) or ""
+    latitude, longitude = request_coordinates(request.args)
+    if latitude is None or longitude is None:
+        latitude = (location or {}).get("latitude")
+        longitude = (location or {}).get("longitude")
+    if latitude is None or longitude is None:
+        return jsonify({"alerts": [], "available": False,
+                        "status": "Set a location to check weather-based in-app advisories."})
+    horizon = request.args.get("horizon_days", 14, type=int)
+    if horizon not in (7, 14, 21, 30):
+        return error_response("Forecast horizon must be 7, 14, 21 or 30 days.")
+    location_id = location_id or f"grid:{round(float(latitude), 3)}:{round(float(longitude), 3)}"
+    forecast = forecast_for_request({"latitude": latitude, "longitude": longitude,
+                                     "location_id": location_id, "horizon_days": horizon})
+    alerts = build_alerts(forecast, location_id, horizon)
+    saved = database.upsert_monsoon_alerts(location_id, alerts) if alerts else database.list_monsoon_alerts(location_id)
+    return jsonify({"alerts": saved, "available": forecast.get("available"),
+                    "status": "Threshold advisories from raw weather-provider ensemble signals; not official warnings."})
+
+
+@app.route("/api/monsoon/alerts/<int:alert_id>/acknowledge", methods=["POST", "OPTIONS"])
+def acknowledge_monsoon_alert(alert_id):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not database.acknowledge_monsoon_alert(alert_id):
+        return error_response("Active alert was not found.", 404)
+    return jsonify({"ok": True, "id": alert_id, "status": "acknowledged"})
+
+
+@app.route("/api/languages", methods=["GET"])
+def api_languages():
+    return jsonify({"languages": [
+        {"code": "en", "label": "English"}, {"code": "hi", "label": "Hindi"},
+        {"code": "te", "label": "Telugu"}, {"code": "ta", "label": "Tamil"},
+        {"code": "kn", "label": "Kannada"}, {"code": "mr", "label": "Marathi"},
+    ]})
 
 
 @app.route("/api/dashboard", methods=["GET"])
@@ -259,7 +648,7 @@ def dashboard():
     return jsonify(
         {
             "summary": {
-                "active_crops": len(crops),
+                "active_crops": sum(1 for crop in crops if crop.get("status") == "active"),
                 "latest_health": latest_scan["health_status"] if latest_scan else "No scans yet",
                 "scans_recorded": len(scans),
             },
@@ -278,15 +667,7 @@ def crops():
 
     payload = request.get_json(silent=True) or {}
     try:
-        crop = database.create_crop(
-            {
-                "crop_name": required_text(payload, "crop_name", "Crop name"),
-                "field_name": required_text(payload, "field_name", "Field name"),
-                "planting_date": required_text(payload, "planting_date", "Planting date"),
-                "location": str(payload.get("location", "")).strip(),
-                "notes": str(payload.get("notes", "")).strip(),
-            }
-        )
+        crop = database.create_crop(parse_crop_payload(payload))
     except ValueError as error:
         return error_response(str(error))
     except Exception:
@@ -295,11 +676,40 @@ def crops():
     return jsonify({"crop": crop_with_summary(crop)}), 201
 
 
-@app.route("/api/crops/<int:crop_id>", methods=["GET"])
+@app.route("/api/crops/<int:crop_id>", methods=["GET", "PUT", "DELETE", "OPTIONS"])
 def get_crop(crop_id):
+    if request.method == "OPTIONS":
+        return ("", 204)
     crop = database.get_crop(crop_id)
-    if not crop:
+    if not crop or crop.get("status") not in {"active", "planned"}:
         return error_response("Crop profile not found.", 404)
+    if request.method == "DELETE":
+        if not database.archive_crop(crop_id):
+            return error_response("Crop profile could not be archived.", 404)
+        return jsonify({"ok": True, "status": "archived", "crop_id": crop_id})
+    if request.method == "PUT":
+        payload = request.get_json(silent=True) or {}
+        try:
+            updated = database.update_crop(crop_id, parse_crop_payload(payload, crop))
+        except ValueError as error:
+            return error_response(str(error))
+        except Exception:
+            return error_response("Could not update crop profile.", 500)
+        if not updated:
+            return error_response("Crop profile was not found.", 404)
+        return jsonify({"crop": crop_with_summary(updated)})
+    return jsonify({"crop": crop_detail(crop)})
+
+
+@app.route("/api/crop-timeline", methods=["GET"])
+def api_crop_timeline():
+    crop_id = request.args.get("crop_id", "")
+    try:
+        crop = database.get_crop(int(crop_id))
+    except (TypeError, ValueError):
+        crop = None
+    if crop is None or crop.get("status") not in {"active", "planned"}:
+        return error_response("A valid crop_id is required.")
     return jsonify({"crop": crop_detail(crop)})
 
 
@@ -309,7 +719,7 @@ def add_scan(crop_id):
         return ("", 204)
 
     crop = database.get_crop(crop_id)
-    if not crop:
+    if not crop or crop.get("status") != "active":
         return error_response("Crop profile not found.", 404)
 
     try:
@@ -317,7 +727,9 @@ def add_scan(crop_id):
         description = request.form.get("description", "").strip()
         latitude, longitude = request_coordinates(request.form)
         image_path = save_upload(request.files.get("image"), f"crop-{crop_id}-scan")
-        lifecycle = estimate_growth_stage(crop["crop_name"], crop["planting_date"], scan_date)
+        calendar = database.get_crop_calendar_rule(crop.get("location_id"), crop["crop_name"])
+        lifecycle = estimate_growth_stage(crop["crop_name"], crop["planting_date"], scan_date,
+                                          calendar_rules=(calendar or {}).get("lifecycle_stages"))
         scan = database.create_scan(
             crop_id=crop_id,
             image_path=image_path,
@@ -338,6 +750,7 @@ def add_scan(crop_id):
 
 
 @app.route("/api/quick-diagnosis", methods=["POST", "OPTIONS"])
+@app.route("/api/disease/analyze", methods=["POST", "OPTIONS"])
 def quick_diagnosis():
     if request.method == "OPTIONS":
         return ("", 204)
@@ -421,9 +834,6 @@ def serve_frontend(path):
 
 
 if __name__ == "__main__":
-    if __name__ == "__main__":
-     import os
-
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),
